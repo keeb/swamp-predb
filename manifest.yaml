@@ -1,0 +1,16 @@
+manifestVersion: 1
+name: "@keeb/predb"
+version: "2026.10.09.1"
+description: "PreDB.net integration for swamp — scene release search, nuke status, NFOs, group/section stats, and per-season completeness by group"
+repository: https://github.com/keeb/swamp-predb
+platforms: []
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+labels:
+  - predb
+  - scene
+  - releases
+  - media
+models:
+  - predb.ts
