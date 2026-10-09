@@ -150,6 +150,7 @@ const SearchSchema = z.object({
   params: z.record(z.string(), z.string()),
   fetchedAt: z.string(),
   pages: z.number(),
+  truncated: z.boolean(),
   count: z.number(),
   releases: z.array(ReleaseSchema),
 });
@@ -208,6 +209,7 @@ const CoverageSchema = z.object({
   query: z.string(),
   fetchedAt: z.string(),
   pages: z.number(),
+  truncated: z.boolean(),
   releaseCount: z.number(),
   episodeCount: z.number(),
   episodeCountSource: z.enum(["argument", "final-tag", "max-seen", "none"]),
@@ -325,6 +327,25 @@ export function mapRelease(r: any): Release {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const MAX_ATTEMPTS = 4;
+
+/**
+ * Milliseconds to wait before retrying a transient failure: honors a
+ * numeric Retry-After header, else 60s for 429 (the rate-limit window)
+ * and linear backoff for 5xx / network errors.
+ */
+export function retryWaitMs(
+  status: number | null,
+  retryAfter: string | null,
+  attempt: number,
+): number {
+  const seconds = Number(retryAfter);
+  if (retryAfter && Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+  return status === 429 ? 60_000 : 5_000 * attempt;
+}
+
 async function apiGet(
   baseUrl: string,
   params: Record<string, string>,
@@ -333,11 +354,35 @@ async function apiGet(
 ): Promise<any> {
   const url = `${baseUrl}?${new URLSearchParams(params)}`;
   for (let attempt = 1;; attempt++) {
-    logger.info("GET {url}", { url });
-    const res = await fetch(url);
-    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+    logger.debug("GET {url}", { url });
+    let res: Response;
+    try {
+      res = await fetch(url);
+    } catch (err) {
+      if (attempt >= MAX_ATTEMPTS) {
+        throw new Error(
+          `PreDB request failed after ${attempt} attempts (${url}): ${
+            (err as Error).message
+          }`,
+        );
+      }
+      const wait = retryWaitMs(null, null, attempt);
+      logger.warning("PreDB network error {error}, retrying in {wait}ms", {
+        error: (err as Error).message,
+        wait,
+      });
+      await sleep(wait);
+      continue;
+    }
+    if (
+      (res.status === 429 || res.status >= 500) && attempt < MAX_ATTEMPTS
+    ) {
       await res.body?.cancel();
-      const wait = res.status === 429 ? 60_000 : 5_000 * attempt;
+      const wait = retryWaitMs(
+        res.status,
+        res.headers.get("retry-after"),
+        attempt,
+      );
       logger.warning("PreDB returned {status}, retrying in {wait}ms", {
         status: res.status,
         wait,
@@ -345,27 +390,40 @@ async function apiGet(
       await sleep(wait);
       continue;
     }
-    if (!res.ok) {
-      throw new Error(`PreDB API error: ${res.status} ${res.statusText}`);
+    const text = await res.text();
+    // deno-lint-ignore no-explicit-any
+    let json: any = null;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      // non-JSON body; reported below
     }
-    const json = await res.json();
-    if (json.status !== "success") {
-      throw new Error(`PreDB API error: ${json.message || "unknown error"}`);
+    if (!res.ok || json?.status !== "success") {
+      const detail = json?.message || text.slice(0, 200) || res.statusText;
+      throw new Error(
+        `PreDB API error ${res.status} for ${new URLSearchParams(
+          params,
+        )}: ${detail}`,
+      );
     }
     return json;
   }
 }
 
-/** Fetch every page of a search, deduped by release name. */
+/**
+ * Fetch every page of a search, deduped by release name. `truncated` is
+ * true when maxPages was hit on a full page, so more results may exist.
+ */
 async function searchAll(
   baseUrl: string,
   params: Record<string, string>,
   maxPages: number,
   logger: Logger,
-): Promise<{ releases: Release[]; pages: number }> {
+): Promise<{ releases: Release[]; pages: number; truncated: boolean }> {
   const limit = Number(params.limit ?? "100");
   const seen = new Map<string, Release>();
   let pages = 0;
+  let truncated = false;
   for (let page = 1; page <= maxPages; page++) {
     if (page > 1) await sleep(REQUEST_SPACING_MS);
     const json = await apiGet(
@@ -375,15 +433,20 @@ async function searchAll(
     );
     pages = page;
     const data = Array.isArray(json.data) ? json.data : [];
-    for (const r of data) seen.set(String(r.release), mapRelease(r));
+    for (const r of data) {
+      if (r && typeof r.release === "string") {
+        seen.set(r.release, mapRelease(r));
+      }
+    }
     if (data.length < limit) break;
-    if (page === maxPages) {
+    if (page >= maxPages) {
+      truncated = true;
       logger.warning("Stopped at maxPages={maxPages}; results may be partial", {
         maxPages,
       });
     }
   }
-  return { releases: [...seen.values()], pages };
+  return { releases: [...seen.values()], pages, truncated };
 }
 
 function variantKey(r: Release): string {
@@ -622,7 +685,8 @@ export const model = {
         for (const k of ["q", "group", "section", "genre", "tag", "status"]) {
           if (args[k]) params[k] = args[k];
         }
-        const { releases, pages } = await searchAll(
+        context.logger.info("Searching PreDB {params}", { params });
+        const { releases, pages, truncated } = await searchAll(
           context.globalArgs.baseUrl,
           params,
           args.maxPages,
@@ -630,14 +694,22 @@ export const model = {
         );
         const filters = ["q", "group", "section", "genre", "tag", "status"]
           .filter((k) => args[k]).map((k) => `${k}-${args[k]}`).join("-");
-        const name = args.name ?? `search-${slugify(filters) || "latest"}`;
+        // always prefixed so a custom name can't land on another spec's instance
+        const name = `search-${
+          slugify(args.name ?? "") || slugify(filters) || "latest"
+        }`;
         const handle = await context.writeResource("releases", name, {
           params,
           fetchedAt: new Date().toISOString(),
           pages,
+          truncated,
           count: releases.length,
           releases,
         });
+        context.logger.info(
+          "Stored {count} releases from {pages} page(s) as {name}",
+          { count: releases.length, pages, name },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -655,16 +727,21 @@ export const model = {
           context.logger,
         );
         const data = Array.isArray(json.data) ? json.data : [];
+        const pre = data.length > 0 ? mapRelease(data[0]) : null;
         const handle = await context.writeResource(
           "release",
           `release-${args.release}`,
           {
             release: args.release,
-            found: data.length > 0,
+            found: pre !== null,
             fetchedAt: new Date().toISOString(),
-            pre: data.length > 0 ? mapRelease(data[0]) : null,
+            pre,
           },
         );
+        context.logger.info("{release}: {result}", {
+          release: args.release,
+          result: pre ? `pre'd ${pre.preAt}, ${pre.statusName}` : "not found",
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -687,13 +764,21 @@ export const model = {
         const nfoImageUrl: string | null = json.data?.nfo_img || null;
         let content: string | null = null;
         if (nfoUrl && args.fetchContent) {
-          const res = await fetch(nfoUrl);
-          if (res.ok) {
+          // the NFO text is optional; a failed download still records the URLs
+          let res: Response | null = null;
+          try {
+            res = await fetch(nfoUrl);
+          } catch (err) {
+            context.logger.warning("NFO download failed: {error}", {
+              error: (err as Error).message,
+            });
+          }
+          if (res?.ok) {
             // NFOs are CP437; latin1 keeps the bytes readable without mangling ASCII
             content = new TextDecoder("latin1").decode(
               new Uint8Array(await res.arrayBuffer()),
             );
-          } else {
+          } else if (res) {
             await res.body?.cancel();
             context.logger.warning("NFO download failed: {status}", {
               status: res.status,
@@ -712,6 +797,12 @@ export const model = {
             content,
           },
         );
+        context.logger.info("{release}: NFO {result}", {
+          release: args.release,
+          result: nfoUrl
+            ? (content ? `${content.length} chars` : "url only")
+            : "not found",
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -763,6 +854,10 @@ export const model = {
           fetchedAt: new Date().toISOString(),
           data,
         });
+        context.logger.info("Stored {kind} stats as {name}", {
+          kind: args.kind,
+          name,
+        });
         return { dataHandles: [handle] };
       },
     },
@@ -790,7 +885,10 @@ export const model = {
         const query = `${args.show.trim().replace(/[\s.]+/g, ".")}.S${
           String(args.season).padStart(2, "0")
         }`;
-        const { releases, pages } = await searchAll(
+        context.logger.info("Fetching every PreDB release for {query}", {
+          query,
+        });
+        const { releases, pages, truncated } = await searchAll(
           context.globalArgs.baseUrl,
           { q: query, order_by: "release", sort: "ASC", limit: "100" },
           args.maxPages,
@@ -824,6 +922,7 @@ export const model = {
             query,
             fetchedAt: new Date().toISOString(),
             pages,
+            truncated,
             releaseCount: releases.length,
             ...coverage,
           },
